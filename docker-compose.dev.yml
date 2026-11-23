@@ -1,0 +1,84 @@
+# Local development.
+#   docker compose -f docker-compose.dev.yml up -d --build   ->  dashboard: http://localhost:5174
+#                                                                gateway API: http://localhost:8000/api/v1/chat
+# Live code is mounted into the containers: Django and Vite reload when you save a file.
+# Rebuild (--build) only after changing backend/requirements.txt or backend/Dockerfile.
+#
+# Values come from the .env file in this folder (copy .env.example to .env first).
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: llm_gateway_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-llm_gateway}
+      POSTGRES_USER: ${POSTGRES_USER:-llm_gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"   # reachable from the laptop (DB tools)
+    volumes:
+      - gw_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: llm_gateway_redis
+    # Only a cache (saved answers): nothing written to disk, max 64 MB, oldest entries dropped first.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: llm_gateway_backend
+    command: ["sh", "-c", "python manage.py migrate --noinput && exec python manage.py runserver 0.0.0.0:8000"]
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      REDIS_URL: "redis://redis:6379/0"
+      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,backend"
+    ports:
+      - "8000:8000"   # the gateway API, for apps (and the load test) on the laptop
+    volumes:
+      - ./backend:/app/backend   # live code; new migration files also land in your folder
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  frontend:
+    image: node:22-alpine          # Vite dev server with hot reload
+    container_name: llm_gateway_frontend
+    working_dir: /app
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0"]
+    ports:
+      - "5174:5173"                # 5174 on the laptop: 5173 is used by the Knowledge Hub project
+    volumes:
+      - ./frontend:/app            # live frontend code
+      - /app/node_modules          # Linux packages stay inside the container, not in your folder
+    environment:
+      API_PROXY_TARGET: "http://backend:8000"
+      WATCH_POLLING: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  gw_pgdata:
